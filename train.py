@@ -3,38 +3,50 @@ MTAB-SC 训练主流程
 
 完整实现论文 Algorithm 1。
 
-算法流程：
-  输入: MGSTNet, TD（训练数据）
+算法流程（对应论文 Algorithm 1）：
+  输入: MGSTNet（已预训练）, TD（冷启动训练数据）
   输出: evalAgent_B, evalAgent_C, evalMixing
 
-  1. 初始化参数更新频率 P_B 和 P_C
-  2. 初始化经验池 D_B (大小 M_B) 和 D_C (大小 M_C)
-  3. 初始化 evalAgent_B, evalAgent_C, evalMixing
-  4. 复制到 targetAgent_B, targetAgent_C, targetMixing
+  初始化:
+    P_B, P_C（target 网络更新频率）
+    D_B（大小 M_B）, D_C（大小 M_C）经验回放池
+    evalAgent_B, evalAgent_C, evalMixing
+    targetAgent_B, targetAgent_C, targetMixing
 
-  主循环 (rl_epochs 次):
-    // 预算分配 (Lines 5-12)
-    for k = 1 to n:
-      获取 s_B^k，用 ε-greedy 分配 budget^k
-      存入 D_B（中间步骤 r_B=0，最后一步计算 r_B）
+  外层循环: for t = cold_start+1 to T（即逐周期顺序推进，共 156 个感知周期）:
+    // 内层循环：每个感知周期内执行多轮 RL 训练（rl_steps_per_cycle）
+    for rl_step = 1 to rl_steps_per_cycle:
+      // 步骤1: 预算分配（Lines 5-12）
+      for k = 1 to n_tasks:
+        获取 s_B^k，用 ε-greedy 分配 budget^k
+        存入 D_B（中间步骤 r_B=0，最后一步计算 r_B）
 
-    // 获取 GTD_train (Line 13)
-    GTD_train = MGSTNet(SGTD[:, -j+1:], 0_vec)
+      // 步骤2: 获取 GTD_train（Line 13）
+      GTD_train = MGSTNet(SGTD[:, -j+1:], 0_vec)
 
-    // 协同数据采集 (Lines 14-32)
-    for t = 1 to max(budgets):
-      获取全局状态 s_C
-      for k = 1 to n: 用 ε-greedy 选择 a_C^k（若 t > budget^k 则 no-op）
-      更新 SGTD_train
-      计算 r_C (公式 16)
-      存入 D_C
-      按频率 P_C 更新采集智能体
+      // 步骤3: 协同数据采集（Lines 14-32）
+      for step = 1 to max(budgets):
+        获取全局状态 s_C
+        for k = 1 to n: 用 ε-greedy 选择采集区域 a_C^k
+        执行采集，更新 SGTD_train
+        计算 r_C（公式 16，推断误差变化量）
+        存入 D_C
+        按频率 P_C 更新采集智能体和 target 网络
 
-    // 更新预算分配智能体 (Lines 33-39)
-    按频率 P_B 更新 evalAgent_B
+      // 步骤4: 更新预算分配智能体（Lines 33-39）
+      计算最终 r_B（公式 15）
+      按频率 P_B 更新预算智能体和 target 网络
+
+    // 步骤5: MTZOOM 更新训练数据（每个周期更新一次，滑动窗口前移）
+    TD = MTZOOM.update(TD, SGTD_train, coverage)
+
+    // 步骤6: 定期重训练 MGSTNet（每 retrain_interval 个周期重训练一次）
+    if (t+1) % retrain_interval == 0:
+      重训练 MGSTNet net_epochs 轮
 
 用法示例：
-  python train.py --dataset traffic --budget 7 --epochs 1000 --device cpu
+  python train.py --dataset traffic --budget 7 --device cpu
+  python train.py --dataset air_quality --budget 20 --rl_steps_per_cycle 6 --retrain_interval 10
 """
 
 import argparse
@@ -69,9 +81,13 @@ def parse_args():
     parser.add_argument("--budget", type=int, default=7,
                         help="总预算 B_total")
     parser.add_argument("--epochs", type=int, default=None,
-                        help="强化学习训练轮数（覆盖 config）")
+                        help="强化学习总训练步数（覆盖 config，自动分配到各感知周期）")
     parser.add_argument("--net_epochs", type=int, default=None,
                         help="MGSTNet 预训练轮数（覆盖 config）")
+    parser.add_argument("--rl_steps_per_cycle", type=int, default=None,
+                        help="每个感知周期内的 RL 训练步数（优先级高于 --epochs）")
+    parser.add_argument("--retrain_interval", type=int, default=10,
+                        help="MGSTNet 重训练间隔（每隔多少个感知周期重训练一次，默认 10）")
     parser.add_argument("--device", type=str, default="cpu",
                         help="计算设备，如 cpu 或 cuda")
     parser.add_argument("--save_dir", type=str, default="checkpoints",
@@ -182,10 +198,10 @@ def train(args):
     n_tasks = cfg_dataset["n_tasks"]
     cold_start = cfg_dataset["cold_start_cycles"]
     B_total = args.budget
-    rl_epochs = args.epochs or config["rl_epochs"]
     net_epochs = args.net_epochs or config["net_epochs"]
     td_length = config["td_length"]
     device = args.device
+    retrain_interval = args.retrain_interval
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -196,6 +212,26 @@ def train(args):
     # gtd:      (m, t, n)
     # cold_gtd: (m, cold_start, n)
     # exec_gtd: (m, t-cold_start, n)
+
+    # 执行阶段感知周期数（论文中 t=cold_start+1 到 t=T，共 156 个周期）
+    n_exec_cycles = exec_gtd.shape[1]
+
+    # 每个感知周期内的 RL 训练步数
+    # 优先使用 --rl_steps_per_cycle；若未指定则由 --epochs 除以周期数计算；最终默认约 6
+    if args.rl_steps_per_cycle is not None:
+        rl_steps_per_cycle = args.rl_steps_per_cycle
+    elif args.epochs is not None:
+        rl_steps_per_cycle = max(1, args.epochs // n_exec_cycles)
+    else:
+        rl_steps_per_cycle = max(1, config["rl_epochs"] // n_exec_cycles)
+
+    # ε 衰减基于整个训练过程的总步数
+    total_rl_steps = n_exec_cycles * rl_steps_per_cycle
+
+    print(f"[INFO] 执行阶段感知周期数: {n_exec_cycles}")
+    print(f"[INFO] 每周期 RL 训练步数: {rl_steps_per_cycle}")
+    print(f"[INFO] 总 RL 训练步数: {total_rl_steps}")
+    print(f"[INFO] MGSTNet 重训练间隔: 每 {retrain_interval} 个周期")
 
     # ── 2. 初始化 MTZOOM 和训练数据 ──────────────────────────────────────────
     mtzoom = MTZOOM(n_tasks=n_tasks, lambda_t=config["lambda_t"])
@@ -227,7 +263,7 @@ def train(args):
         gamma=config["gamma"],
         epsilon_start=config["epsilon_start"],
         epsilon_end=config["epsilon_end"],
-        rl_epochs=rl_epochs,
+        rl_epochs=total_rl_steps,   # ε 衰减基于总步数
         device=device,
     )
     collection_agents = CollectionAgents(
@@ -238,7 +274,7 @@ def train(args):
         gamma=config["gamma"],
         epsilon_start=config["epsilon_start"],
         epsilon_end=config["epsilon_end"],
-        rl_epochs=rl_epochs,
+        rl_epochs=total_rl_steps,   # ε 衰减基于总步数
         device=device,
     )
 
@@ -251,162 +287,176 @@ def train(args):
     step_b = 0
     step_c = 0
 
-    # ── 6. 主训练循环（Algorithm 1）─────────────────────────────────────────
-    print(f"[INFO] 开始强化学习训练，总轮数 {rl_epochs} ...")
     adj_np = adj  # numpy 邻接矩阵
 
-    for epoch in tqdm(range(rl_epochs), desc="RL Training"):
-        # 随机选取一个执行周期作为当前感知周期
-        t_idx = np.random.randint(0, exec_gtd.shape[1])
-        gtd_current = exec_gtd[:, t_idx, :]  # (m, n_tasks)
+    # ── 6. 主训练循环（Algorithm 1）─────────────────────────────────────────
+    # 外层循环：顺序遍历 n_exec_cycles 个感知周期（对应论文 t=cold_start+1 到 t=T）
+    print(f"[INFO] 开始在线感知训练，共 {n_exec_cycles} 个感知周期 ...")
 
-        # ── Lines 5-12：预算分配 ─────────────────────────────────────────
-        budget_state = np.zeros(n_tasks, dtype=np.float32)  # 初始状态：各任务预算为 0
-        allocated_budgets = []
-        remaining = B_total
-
-        for k in range(n_tasks):
-            s_B = budget_state.copy()
-            if remaining <= 0:
-                # 无预算可分配，直接设为 0，且不存入经验池（无效动作不参与训练）
-                budget_k = 0
-                allocated_budgets.append(budget_k)
-                budget_state[k] = budget_k
-                continue
-
-            budget_k = budget_agent.select_action(s_B, remaining)
-            budget_k = min(budget_k, remaining)
-            allocated_budgets.append(budget_k)
-            remaining = max(0, remaining - budget_k)
-
-            # 更新状态
-            budget_state[k] = budget_k
-            s_B_next = budget_state.copy()
-
-            # 中间步骤奖励为 0；最后一步稍后计算
-            r_B_intermediate = 0.0
-            buffer_B.push(s_B, budget_k, s_B_next, r_B_intermediate)
-
-        # ── Line 13：获取 GTD_train（用 MGSTNet 补全稀疏数据）──────────────
-        # 初始化稀疏采集数据：全 0
-        sgtd_train_list = [np.zeros(m_areas, dtype=np.float32)
+    # 用于记录最后一个 rl_step 的采集结果，供 MTZOOM 更新使用
+    sgtd_train_list_final = [np.zeros(m_areas, dtype=np.float32)
+                             for _ in range(n_tasks)]
+    coverage_list_final = [np.zeros(m_areas, dtype=np.float32)
                            for _ in range(n_tasks)]
-        coverage_list = [np.zeros(m_areas, dtype=np.float32)
-                         for _ in range(n_tasks)]
-        budget_remaining = allocated_budgets.copy()
+    gtd_inferred_after = np.zeros((m_areas, n_tasks), dtype=np.float32)
+    sel_matrix = np.zeros((m_areas, n_tasks), dtype=np.float32)
 
-        # MGSTNet 初步推断（基于训练数据）
-        gtd_inferred_before = mgstnet.infer(td_list, adj_np, device)  # (m, n_tasks)
+    for t in tqdm(range(n_exec_cycles), desc="Online Sensing"):
+        gtd_current = exec_gtd[:, t, :]  # ✅ 顺序推进第 t 个感知周期 (m, n_tasks)
 
-        # ── Lines 14-32：协同数据采集 ─────────────────────────────────────
-        max_budget = max(allocated_budgets) if allocated_budgets else 1
-        for t in range(1, max_budget + 1):
-            # 全局状态
-            global_state = collection_agents.get_global_state(coverage_list)
+        # ── 内层循环：每个感知周期内执行多轮 RL 训练 ────────────────────────
+        for rl_step in range(rl_steps_per_cycle):
 
-            # 各智能体局部观察
-            obs_list = [
-                CollectionAgents.encode_obs(
-                    [i for i, v in enumerate(coverage_list[k]) if v > 0],
-                    coverage_list[k]
+            # ── Lines 5-12：预算分配 ─────────────────────────────────────
+            budget_state = np.zeros(n_tasks, dtype=np.float32)
+            allocated_budgets = []
+            remaining = B_total
+
+            for k in range(n_tasks):
+                s_B = budget_state.copy()
+                if remaining <= 0:
+                    # 无预算可分配，跳过，不存入经验池
+                    allocated_budgets.append(0)
+                    budget_state[k] = 0
+                    continue
+
+                budget_k = budget_agent.select_action(s_B, remaining)
+                budget_k = min(budget_k, remaining)
+                allocated_budgets.append(budget_k)
+                remaining = max(0, remaining - budget_k)
+
+                # 更新状态
+                budget_state[k] = budget_k
+                s_B_next = budget_state.copy()
+
+                # 中间步骤奖励为 0；最后一步稍后计算
+                r_B_intermediate = 0.0
+                buffer_B.push(s_B, budget_k, s_B_next, r_B_intermediate)
+
+            # ── Line 13：初始化稀疏采集数据，MGSTNet 初步推断 ────────────
+            sgtd_train_list = [np.zeros(m_areas, dtype=np.float32)
+                               for _ in range(n_tasks)]
+            coverage_list = [np.zeros(m_areas, dtype=np.float32)
+                             for _ in range(n_tasks)]
+            budget_remaining = allocated_budgets.copy()
+
+            gtd_inferred_before = mgstnet.infer(td_list, adj_np, device)
+
+            # ── Lines 14-32：协同数据采集 ─────────────────────────────────
+            max_budget = max(allocated_budgets) if any(b > 0 for b in allocated_budgets) else 1
+            for step in range(1, max_budget + 1):
+                # 全局状态
+                global_state = collection_agents.get_global_state(coverage_list)
+
+                # 各智能体局部观察
+                obs_list = [
+                    CollectionAgents.encode_obs(
+                        [i for i, v in enumerate(coverage_list[k]) if v > 0],
+                        coverage_list[k]
+                    )
+                    for k in range(n_tasks)
+                ]
+
+                # ε-greedy 动作选择
+                actions = collection_agents.select_actions(obs_list, budget_remaining)
+
+                # 执行动作，更新采集数据
+                sgtd_train_list, coverage_list, budget_remaining = apply_actions(
+                    actions, sgtd_train_list, gtd_current,
+                    coverage_list, budget_remaining, m_areas
                 )
-                for k in range(n_tasks)
-            ]
 
-            # ε-greedy 动作选择
-            actions = collection_agents.select_actions(obs_list, budget_remaining)
+                # 更新后 MGSTNet 推断（将稀疏采集整合入 td_list 后缀）
+                input_td = [
+                    np.concatenate([
+                        td_list[k][:, 1:],
+                        sgtd_train_list[k].reshape(m_areas, 1)
+                    ], axis=1)
+                    for k in range(n_tasks)
+                ]
+                gtd_inferred_after = mgstnet.infer(input_td, adj_np, device)
 
-            # 执行动作，更新采集数据
-            sgtd_train_list, coverage_list, budget_remaining = apply_actions(
-                actions, sgtd_train_list, gtd_current,
-                coverage_list, budget_remaining, m_areas
-            )
+                # 计算选择矩阵（至少一个任务已采集的区域）
+                sel_matrix = np.stack(coverage_list, axis=1)  # (m, n_tasks)
 
-            # 更新后 MGSTNet 推断
-            # 将 sgtd_train 整合入 td_list 后缀构造输入
-            input_td = [
-                np.concatenate([
-                    td_list[k][:, 1:],
-                    sgtd_train_list[k].reshape(m_areas, 1)
-                ], axis=1)
-                for k in range(n_tasks)
-            ]
-            gtd_inferred_after = mgstnet.infer(input_td, adj_np, device)
+                # 奖励 r_C：推断误差变化量（公式 16）
+                error_before = overall_mape(gtd_current, gtd_inferred_before, sel_matrix)
+                error_after = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
+                r_C = error_before - error_after
 
-            # 计算选择矩阵（至少一个任务已采集的区域）
-            sel_matrix = np.stack(coverage_list, axis=1)  # (m, n_tasks)
+                # 下一状态
+                next_global_state = collection_agents.get_global_state(coverage_list)
+                next_obs_list = [
+                    CollectionAgents.encode_obs(
+                        [i for i, v in enumerate(coverage_list[k]) if v > 0],
+                        coverage_list[k]
+                    )
+                    for k in range(n_tasks)
+                ]
 
-            # 奖励 r_C：推断误差变化量（公式 16）
-            error_before = overall_mape(gtd_current, gtd_inferred_before, sel_matrix)
-            error_after = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
-            r_C = error_before - error_after  # 误差减少则为正奖励
-
-            # 下一状态
-            next_global_state = collection_agents.get_global_state(coverage_list)
-            next_obs_list = [
-                CollectionAgents.encode_obs(
-                    [i for i, v in enumerate(coverage_list[k]) if v > 0],
-                    coverage_list[k]
+                # 存入经验池
+                buffer_C.push(
+                    global_state, next_global_state,
+                    obs_list, next_obs_list,
+                    actions, r_C
                 )
-                for k in range(n_tasks)
-            ]
 
-            # 存入经验池
-            buffer_C.push(
-                global_state, next_global_state,
-                obs_list, next_obs_list,
-                actions, r_C
-            )
+                gtd_inferred_before = gtd_inferred_after
 
-            gtd_inferred_before = gtd_inferred_after
+                # 按频率 P_C 更新采集智能体
+                step_c += 1
+                if step_c % P_C == 0 and len(buffer_C) >= config["rl_batch_size"]:
+                    batch_C = buffer_C.sample(config["rl_batch_size"])
+                    collection_agents.update(batch_C)
+                    collection_agents.update_target()
 
-            # 按频率 P_C 更新采集智能体
-            step_c += 1
-            if step_c % P_C == 0 and len(buffer_C) >= config["rl_batch_size"]:
-                batch_C = buffer_C.sample(config["rl_batch_size"])
-                collection_agents.update(batch_C)
-                collection_agents.update_target()
+            # ── Lines 33-39：更新预算分配智能体 ──────────────────────────
+            # 计算最终奖励 r_B^n（公式 15）
+            C_reward = 1.0
+            if sum(budget_remaining) == 0:
+                final_r_B = C_reward * (-overall_mape(
+                    gtd_current, gtd_inferred_after, sel_matrix))
+            else:
+                final_r_B = 0.0
 
-        # ── Lines 33-39：更新预算分配智能体 ──────────────────────────────
-        # 计算最终奖励 r_B^n（公式 15）
-        # 所有预算耗尽时：r_B = C * (-InferError)
-        C_reward = 1.0  # 奖励缩放系数
-        if sum(budget_remaining) == 0:
-            final_r_B = C_reward * (-overall_mape(
-                gtd_current, gtd_inferred_after, sel_matrix))
-        else:
-            final_r_B = 0.0
+            # 修正缓冲区最后一个 D_B 条目的奖励
+            if len(buffer_B) > 0:
+                last_exp = buffer_B.buffer[-1]
+                buffer_B.buffer[-1] = (last_exp[0], last_exp[1],
+                                       last_exp[2], final_r_B)
 
-        # 更新最后一步的奖励（重新入队）
-        # 注：简化处理：直接存入最终奖励样本
-        # 完整实现中应更新之前存入的最后一步奖励
-        if len(buffer_B) > 0:
-            # 在缓冲区末尾修正最后一个 D_B 条目的奖励
-            last_exp = buffer_B.buffer[-1]
-            buffer_B.buffer[-1] = (last_exp[0], last_exp[1],
-                                   last_exp[2], final_r_B)
+            step_b += 1
+            if step_b % P_B == 0 and len(buffer_B) >= config["rl_batch_size"]:
+                batch_B = buffer_B.sample(config["rl_batch_size"])
+                budget_agent.update(batch_B)
+                budget_agent.update_target()
 
-        step_b += 1
-        if step_b % P_B == 0 and len(buffer_B) >= config["rl_batch_size"]:
-            batch_B = buffer_B.sample(config["rl_batch_size"])
-            budget_agent.update(batch_B)
-            budget_agent.update_target()
+            # ε 衰减（基于总步数）
+            budget_agent.decay_epsilon()
+            collection_agents.decay_epsilon()
 
-        # ── MTZOOM 更新训练数据 ──────────────────────────────────────────
+            # 保存最后一个 rl_step 的采集结果供 MTZOOM 使用
+            sgtd_train_list_final = sgtd_train_list
+            coverage_list_final = coverage_list
+
+        # ── 步骤5: MTZOOM 更新训练数据（每个感知周期更新一次，滑动窗口前移）──
         td_list = mtzoom.update(
             td_list,
-            sgtd_train_list,
-            [cov.copy() for cov in coverage_list]
+            sgtd_train_list_final,
+            [cov.copy() for cov in coverage_list_final]
         )
 
-        # ε 衰减
-        budget_agent.decay_epsilon()
-        collection_agents.decay_epsilon()
+        # ── 步骤6: 定期重训练 MGSTNet ──────────────────────────────────────
+        if (t + 1) % retrain_interval == 0:
+            print(f"\n[周期 {t+1}/{n_exec_cycles}] 重训练 MGSTNet "
+                  f"({config['M_epochs']} 轮) ...")
+            pretrain_mgstnet(mgstnet, td_list, gtd_current, adj,
+                             config["M_epochs"], config["net_batch_size"], device)
 
-        # 每 100 轮打印一次
-        if (epoch + 1) % 100 == 0:
-            mape_val = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
-            print(f"\n[Epoch {epoch+1}/{rl_epochs}]  MAPE: {mape_val:.2f}%  "
+        # 每个感知周期打印一次进度
+        mape_val = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
+        if (t + 1) % 10 == 0 or t == 0:
+            print(f"\n[周期 {t+1}/{n_exec_cycles}]  MAPE: {mape_val:.2f}%  "
                   f"ε_B: {budget_agent.epsilon:.3f}  "
                   f"ε_C: {collection_agents.epsilon:.3f}")
 

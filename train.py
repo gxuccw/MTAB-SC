@@ -267,6 +267,13 @@ def train(args):
 
         for k in range(n_tasks):
             s_B = budget_state.copy()
+            if remaining <= 0:
+                # 无预算可分配，直接设为 0，且不存入经验池（无效动作不参与训练）
+                budget_k = 0
+                allocated_budgets.append(budget_k)
+                budget_state[k] = budget_k
+                continue
+
             budget_k = budget_agent.select_action(s_B, remaining)
             budget_k = min(budget_k, remaining)
             allocated_budgets.append(budget_k)

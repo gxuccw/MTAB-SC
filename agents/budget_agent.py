@@ -124,9 +124,13 @@ class BudgetAgent:
         Returns:
             选择的预算值（1-indexed，范围 [1, remaining]）。
         """
+        if remaining <= 0:
+            # 无预算可分配，直接返回 0
+            return 0
+
         if random.random() < self.epsilon:
             # 探索：在剩余预算范围内随机选择
-            return random.randint(1, max(1, remaining))
+            return random.randint(1, remaining)
 
         # 利用：贪心选择 Q 值最大的动作
         state_tensor = torch.tensor(
@@ -158,6 +162,8 @@ class BudgetAgent:
                          device=self.device)             # (batch, n_tasks)
         a = torch.tensor(budgets, dtype=torch.long,
                          device=self.device) - 1         # 转为 0-indexed
+        # 安全 clamp，防止经验池中的异常数据（如 budget=0）导致索引越界
+        a = torch.clamp(a, 0, self.B_total - 1)
         ns = torch.tensor(np.array(next_states), dtype=torch.float32,
                           device=self.device)
         r = torch.tensor(rewards, dtype=torch.float32,

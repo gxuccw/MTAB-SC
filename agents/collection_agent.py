@@ -234,6 +234,8 @@ class CollectionAgents:
             actions_k = torch.tensor(
                 [a[k] - 1 for a in action_batch],               # 转为 0-indexed
                 dtype=torch.long, device=self.device)
+            # 安全 clamp，防止异常动作值导致索引越界
+            actions_k = torch.clamp(actions_k, 0, self.action_dim - 1)
 
             q_vals = self.eval_nets[k](obs_k)                   # (bs, action_dim)
             q_k = q_vals.gather(1, actions_k.unsqueeze(1))      # (bs, 1)

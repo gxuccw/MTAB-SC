@@ -88,6 +88,8 @@ def parse_args():
                         help="每个感知周期内的 RL 训练步数（优先级高于 --epochs）")
     parser.add_argument("--retrain_interval", type=int, default=10,
                         help="MGSTNet 重训练间隔（每隔多少个感知周期重训练一次，默认 10）")
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="日志打印间隔（每隔多少个感知周期打印一次进度，默认 10）")
     parser.add_argument("--device", type=str, default="cpu",
                         help="计算设备，如 cpu 或 cuda")
     parser.add_argument("--save_dir", type=str, default="checkpoints",
@@ -202,6 +204,7 @@ def train(args):
     td_length = config["td_length"]
     device = args.device
     retrain_interval = args.retrain_interval
+    log_interval = args.log_interval
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -453,9 +456,9 @@ def train(args):
             pretrain_mgstnet(mgstnet, td_list, gtd_current, adj,
                              config["M_epochs"], config["net_batch_size"], device)
 
-        # 每个感知周期打印一次进度
+        # 每 log_interval 个感知周期打印一次进度
         mape_val = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
-        if (t + 1) % 10 == 0 or t == 0:
+        if (t + 1) % log_interval == 0 or t == 0:
             print(f"\n[周期 {t+1}/{n_exec_cycles}]  MAPE: {mape_val:.2f}%  "
                   f"ε_B: {budget_agent.epsilon:.3f}  "
                   f"ε_C: {collection_agents.epsilon:.3f}")

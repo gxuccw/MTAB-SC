@@ -23,7 +23,7 @@ from models.mtzoom import MTZOOM
 from models.mgstnet import MGSTNet
 from agents.budget_agent import BudgetAgent
 from agents.collection_agent import CollectionAgents
-from utils.metrics import mape_per_task, overall_mape
+from utils.metrics import mape_per_task, overall_mape, overall_mape_original_scale
 from utils.visualization import plot_mape_vs_budget
 
 
@@ -124,31 +124,33 @@ def evaluate_budget(method: str,
                     cfg_dataset: dict,
                     n_eval_cycles: int,
                     device: str,
+                    scalers: list,
                     budget_agent: BudgetAgent = None,
                     collection_agents: CollectionAgents = None) -> float:
     """
-    对指定预算和方法进行 n_eval_cycles 周期的评估，返回平均 MAPE。
+    对指定预算和方法进行 n_eval_cycles 周期的评估，返回反归一化后的平均 MAPE。
 
     Args:
         method:            方法名，支持 "AB-CoDC"、"RANDOM"、"GREEDY-M"。
         budget:            总预算 B_total。
         exec_gtd:          执行阶段数据，形状 (m, T, n)。
-        td_list:           初始训练数据列表。
+        td_list:           初始训练数据列表（每次调用时已传入独立拷贝）。
         mgstnet:           已训练的 MGSTNet。
         adj:               邻接矩阵。
         mtzoom:            MTZOOM 实例。
         cfg_dataset:       数据集配置字典。
         n_eval_cycles:     评估周期数。
         device:            计算设备。
+        scalers:           MinMaxScaler 列表，每个任务一个，用于反归一化 MAPE。
         budget_agent:      预训练的预算分配智能体（AB-CoDC 专用）。
         collection_agents: 预训练的数据采集智能体（AB-CoDC 专用）。
 
     Returns:
-        n_eval_cycles 周期的平均 MAPE（%）。
+        n_eval_cycles 周期的反归一化后平均 MAPE（%）。
     """
     m_areas = cfg_dataset["m_areas"]
     n_tasks = cfg_dataset["n_tasks"]
-    td_local = [td.copy() for td in td_list]  # 深拷贝，不影响原始数据
+    td_local = td_list  # 调用方已传入独立拷贝，直接使用
     T = exec_gtd.shape[1]
 
     total_mape = 0.0
@@ -221,7 +223,8 @@ def evaluate_budget(method: str,
         # 选择矩阵
         sel_matrix = np.stack(coverage_list, axis=1)  # (m, n_tasks)
 
-        cycle_mape = overall_mape(gtd_current, inferred, sel_matrix)
+        cycle_mape = overall_mape_original_scale(
+            gtd_current, inferred, sel_matrix, scalers)
         total_mape += cycle_mape
 
         # 更新训练数据（MTZOOM）
@@ -249,7 +252,8 @@ def evaluate(args):
 
     # ── 2. 初始化 MTZOOM 和训练数据 ──────────────────────────────────────────
     mtzoom = MTZOOM(n_tasks=n_tasks, lambda_t=config["lambda_t"])
-    td_list = mtzoom.initialize_td(cold_gtd, window=td_length)
+    td_list_init = mtzoom.initialize_td(cold_gtd, window=td_length)
+    # 保存初始状态，每个 method+budget 评估时独立重置
 
     # ── 3. 加载 MGSTNet ──────────────────────────────────────────────────────
     mgstnet = MGSTNet(
@@ -300,17 +304,20 @@ def evaluate(args):
     for budget in args.budgets:
         print(f"\n[INFO] 预算 = {budget}")
         for method in methods:
+            # 每个 method+budget 组合独立重置 td_list，确保评估结果互不干扰
+            td_list_copy = [td.copy() for td in td_list_init]
             mape_val = evaluate_budget(
                 method=method,
                 budget=budget,
                 exec_gtd=exec_gtd,
-                td_list=td_list,
+                td_list=td_list_copy,
                 mgstnet=mgstnet,
                 adj=adj,
                 mtzoom=mtzoom,
                 cfg_dataset=cfg_dataset,
                 n_eval_cycles=args.n_eval_cycles,
                 device=device,
+                scalers=scalers,
                 budget_agent=budget_agent if method == "AB-CoDC" else None,
                 collection_agents=collection_agents if method == "AB-CoDC" else None,
             )

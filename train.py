@@ -64,7 +64,7 @@ from models.mgstnet import MGSTNet
 from agents.budget_agent import BudgetAgent
 from agents.collection_agent import CollectionAgents
 from agents.replay_buffer import ReplayBufferB, ReplayBufferC
-from utils.metrics import overall_mape
+from utils.metrics import overall_mape, overall_mae
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,9 +382,9 @@ def train(args):
                 # 计算选择矩阵（至少一个任务已采集的区域）
                 sel_matrix = np.stack(coverage_list, axis=1)  # (m, n_tasks)
 
-                # 奖励 r_C：推断误差变化量（公式 16）
-                error_before = overall_mape(gtd_current, gtd_inferred_before, sel_matrix)
-                error_after = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
+                # 奖励 r_C：推断误差变化量（公式 16），使用 MAE 避免归一化数据上 MAPE 爆炸
+                error_before = overall_mae(gtd_current, gtd_inferred_before, sel_matrix)
+                error_after = overall_mae(gtd_current, gtd_inferred_after, sel_matrix)
                 r_C = error_before - error_after
 
                 # 下一状态
@@ -414,10 +414,10 @@ def train(args):
                     collection_agents.update_target()
 
             # ── Lines 33-39：更新预算分配智能体 ──────────────────────────
-            # 计算最终奖励 r_B^n（公式 15）
+            # 计算最终奖励 r_B^n（公式 15），使用 MAE 避免归一化数据上 MAPE 爆炸
             C_reward = 1.0
             if sum(budget_remaining) == 0:
-                final_r_B = C_reward * (-overall_mape(
+                final_r_B = C_reward * (-overall_mae(
                     gtd_current, gtd_inferred_after, sel_matrix))
             else:
                 final_r_B = 0.0
@@ -456,10 +456,11 @@ def train(args):
             pretrain_mgstnet(mgstnet, td_list, gtd_current, adj,
                              config["M_epochs"], config["net_batch_size"], device)
 
-        # 每 log_interval 个感知周期打印一次进度
+        # 每 log_interval 个感知周期打印一次进度（同时输出 MAE 训练指标和 MAPE 参考指标）
+        mae_val = overall_mae(gtd_current, gtd_inferred_after, sel_matrix)
         mape_val = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
         if (t + 1) % log_interval == 0 or t == 0:
-            print(f"\n[周期 {t+1}/{n_exec_cycles}]  MAPE: {mape_val:.2f}%  "
+            print(f"\n[周期 {t+1}/{n_exec_cycles}]  MAE: {mae_val:.4f}  MAPE: {mape_val:.2f}%  "
                   f"ε_B: {budget_agent.epsilon:.3f}  "
                   f"ε_C: {collection_agents.epsilon:.3f}")
 

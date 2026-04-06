@@ -64,7 +64,7 @@ from models.mgstnet import MGSTNet
 from agents.budget_agent import BudgetAgent
 from agents.collection_agent import CollectionAgents
 from agents.replay_buffer import ReplayBufferB, ReplayBufferC
-from utils.metrics import overall_mape, overall_mae
+from utils.metrics import overall_mape, overall_mae, overall_mape_original_scale
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -456,9 +456,10 @@ def train(args):
             pretrain_mgstnet(mgstnet, td_list, gtd_current, adj,
                              config["M_epochs"], config["net_batch_size"], device)
 
-        # 每 log_interval 个感知周期打印一次进度（同时输出 MAE 训练指标和 MAPE 参考指标）
+        # 每 log_interval 个感知周期打印一次进度（同时输出 MAE 训练指标和反归一化 MAPE 参考指标）
         mae_val = overall_mae(gtd_current, gtd_inferred_after, sel_matrix)
-        mape_val = overall_mape(gtd_current, gtd_inferred_after, sel_matrix)
+        mape_val = overall_mape_original_scale(
+            gtd_current, gtd_inferred_after, sel_matrix, scalers)
         if (t + 1) % log_interval == 0 or t == 0:
             print(f"\n[周期 {t+1}/{n_exec_cycles}]  MAE: {mae_val:.4f}  MAPE: {mape_val:.2f}%  "
                   f"ε_B: {budget_agent.epsilon:.3f}  "

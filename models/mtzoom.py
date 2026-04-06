@@ -80,17 +80,23 @@ class MTZOOM:
             # 当前训练数据最后一列（最近历史）
             td_last = td_k[:, -1]        # (m,)
 
-            # ── 时空渐变比率 ──────────────────────────────────────────────────
-            avg_sgtd_k = np.mean(sgtd_k[sel_k > 0]) if sel_k.sum() > 0 else 1.0
-            avg_td_last = np.mean(td_last) if np.mean(td_last) != 0 else 1.0
+            # ── 时空渐变比率（带安全保护）────────────────────────────────────
+            # 无采集数据时用历史均值代替，避免使用常数 1.0 导致逻辑不一致
+            if sel_k.sum() > 0:
+                avg_sgtd_k = np.mean(sgtd_k[sel_k > 0])
+            else:
+                avg_sgtd_k = np.mean(np.abs(td_last))
+
+            # 使用绝对值均值，防止符号相消导致接近 0；最小值限为 1e-6 防止除零
+            avg_td_last = max(float(np.mean(np.abs(td_last))), 1e-6)
             grad_ratio = avg_sgtd_k / avg_td_last  # 标量，全局渐变比率
+            # 限制渐变比率在合理范围内，防止数值溢出
+            grad_ratio = float(np.clip(grad_ratio, 0.1, 10.0))
 
             # ── 逐区域估计 ────────────────────────────────────────────────────
             y_k = np.zeros(m, dtype=np.float32)
             for i in range(m):
                 td_ki = td_last[i]
-                if td_ki == 0:
-                    td_ki = 1e-8  # 防止除零
 
                 if sel_k[i] > 0:
                     # 有采集数据：结合时空渐变 + 数据集间相似性
@@ -100,8 +106,13 @@ class MTZOOM:
                             continue
                         sgtd_n = sgtd_list[n_idx]    # (m,)
                         td_n = td_list[n_idx][:, -1]  # (m,)
-                        denom = td_n[i] if td_n[i] != 0 else 1e-8
-                        inter_term += self.lambda_s * (sgtd_n[i] / denom)
+                        # 使用绝对值下界保护，防止极小分母导致溢出
+                        denom = td_n[i]
+                        if np.abs(denom) < 1e-6:
+                            denom = 1e-6 if denom >= 0 else -1e-6
+                        ratio = sgtd_n[i] / denom
+                        ratio = float(np.clip(ratio, -10.0, 10.0))  # 防溢出
+                        inter_term += self.lambda_s * ratio
 
                     y_k[i] = td_ki * (self.lambda_t * grad_ratio + inter_term)
                 else:
@@ -111,6 +122,12 @@ class MTZOOM:
                     # 因此直接用 grad_ratio 进行全局缩放，不应乘以 λ_t。
                     y_k[i] = td_ki * grad_ratio
 
+                # NaN/inf 安全检查：异常时回退为原始历史值
+                if not np.isfinite(y_k[i]):
+                    y_k[i] = td_last[i]
+
+            # 限制在归一化数据的合理范围内（MinMax 归一化后数据在 [0, 1]）
+            y_k = np.clip(y_k, 0.0, 1.0)
             new_last_cols.append(y_k)
 
         # ── 滑动窗口：移除最早时间步，追加新估计列 ────────────────────────────

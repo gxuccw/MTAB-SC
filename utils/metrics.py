@@ -170,3 +170,79 @@ def overall_mae(ground_truth: np.ndarray,
     """
     per_task = mae_per_task(ground_truth, inferred, selection_matrix)
     return float(per_task.mean())
+
+
+def mape_original_scale(ground_truth: np.ndarray,
+                        inferred: np.ndarray,
+                        selection_matrix: np.ndarray,
+                        scaler,
+                        eps: float = 1e-8) -> float:
+    """
+    先将归一化数据反归一化回原始尺度，再计算未采集区域的 MAPE。
+
+    反归一化公式：原始值 = 归一化值 × (max - min) + min
+
+    Args:
+        ground_truth:     归一化后的真实数据，形状 (m,)。
+        inferred:         归一化后的推断数据，形状 (m,)。
+        selection_matrix: 采集标记，形状 (m,)，1=已采集，0=未采集。
+        scaler:           sklearn MinMaxScaler，用于反归一化。
+        eps:              真实值绝对值低于此阈值的点将被跳过，防止除以接近 0 的值。
+
+    Returns:
+        反归一化后的 MAPE（百分比，float）。未采集区域为空时返回 0.0。
+    """
+    ground_truth = np.asarray(ground_truth, dtype=np.float64).reshape(-1, 1)
+    inferred = np.asarray(inferred, dtype=np.float64).reshape(-1, 1)
+    selection_matrix = np.asarray(selection_matrix, dtype=np.float64).flatten()
+
+    # 反归一化回原始尺度
+    gt_orig = scaler.inverse_transform(ground_truth).flatten()
+    inf_orig = scaler.inverse_transform(inferred).flatten()
+
+    not_collected = (selection_matrix == 0) & (np.abs(gt_orig) >= eps)
+    s = not_collected.sum()
+    if s == 0:
+        return 0.0
+
+    gt_vals = gt_orig[not_collected]
+    inf_vals = inf_orig[not_collected]
+
+    error = np.abs(gt_vals - inf_vals) / np.abs(gt_vals)
+    return float(error.sum() / s * 100.0)
+
+
+def overall_mape_original_scale(ground_truth: np.ndarray,
+                                inferred: np.ndarray,
+                                selection_matrix: np.ndarray,
+                                scalers: list,
+                                eps: float = 1e-8) -> float:
+    """
+    先将归一化数据反归一化回原始尺度，再计算所有任务整体平均 MAPE。
+
+    Args:
+        ground_truth:     归一化后的真实数据，形状 (m, n_tasks)。
+        inferred:         归一化后的推断数据，形状 (m, n_tasks)。
+        selection_matrix: 采集标记，形状 (m, n_tasks) 或 (m,)。
+        scalers:          MinMaxScaler 列表，每个任务一个（长度 n_tasks）。
+        eps:              真实值绝对值低于此阈值的点将被跳过。
+
+    Returns:
+        所有任务反归一化后 MAPE 的均值（float）。
+    """
+    ground_truth = np.asarray(ground_truth, dtype=np.float64)
+    inferred = np.asarray(inferred, dtype=np.float64)
+
+    n_tasks = ground_truth.shape[1] if ground_truth.ndim == 2 else 1
+    results = np.zeros(n_tasks, dtype=np.float64)
+
+    for k in range(n_tasks):
+        gt_k = ground_truth[:, k] if ground_truth.ndim == 2 else ground_truth
+        inf_k = inferred[:, k] if inferred.ndim == 2 else inferred
+        if selection_matrix.ndim == 2:
+            sel_k = selection_matrix[:, k]
+        else:
+            sel_k = np.asarray(selection_matrix, dtype=np.float64)
+        results[k] = mape_original_scale(gt_k, inf_k, sel_k, scalers[k], eps)
+
+    return float(results.mean())

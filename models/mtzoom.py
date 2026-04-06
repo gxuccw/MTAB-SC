@@ -105,8 +105,11 @@ class MTZOOM:
 
                     y_k[i] = td_ki * (self.lambda_t * grad_ratio + inter_term)
                 else:
-                    # 无采集数据：仅使用时空渐变
-                    y_k[i] = td_ki * self.lambda_t * grad_ratio
+                    # 无采集数据：仅使用时空渐变比率整体缩放。
+                    # 论文公式(5)中有采集数据时的 λ_t 是为了在时空渐变和数据集间相似性
+                    # 之间做加权平均（二者之和为 1）。无采集数据时不存在 inter-dataset 项，
+                    # 因此直接用 grad_ratio 进行全局缩放，不应乘以 λ_t。
+                    y_k[i] = td_ki * grad_ratio
 
             new_last_cols.append(y_k)
 

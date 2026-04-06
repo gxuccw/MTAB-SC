@@ -267,4 +267,5 @@ class MGSTNet(nn.Module):
             for td in td_list
         ]  # 每个元素形状 (1, m, j)
         out = self.forward(sgtd_tensors, adj_tensor)  # (1, m, n_tasks)
+        out = torch.clamp(out, 0.0, 1.0)              # 限制输出在归一化范围 [0, 1] 内
         return out.squeeze(0).cpu().numpy()           # (m, n_tasks)
